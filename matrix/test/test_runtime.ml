@@ -346,6 +346,62 @@ let test_close_restores_raw_mode_if_terminal_close_raises () =
   equal ~msg:"raw mode restored" int 1 !raw_restore_calls;
   equal ~msg:"cleanup called" int 1 !cleanup_calls
 
+let test_primary_close_preserves_presented_cells () =
+  let app, state =
+    make_app ~mode:`Primary ~terminal_tty:true ~render_offset:10
+      ~target_fps:None ()
+  in
+  Matrix.prepare app;
+  Matrix.Grid.draw_text (Matrix.grid app) ~x:0 ~y:0 ~text:"retained";
+  Matrix.submit app;
+  Buffer.clear state.terminal_output;
+  Matrix.close app;
+  let output = Buffer.contents state.terminal_output in
+  is_false ~msg:"primary close does not erase presented rows"
+    (contains_substring "\027[2K" output);
+  equal ~msg:"primary close restores raw mode" int 1 state.raw_restore_calls;
+  equal ~msg:"primary close releases backend" int 1 state.cleanup_calls
+
+let test_finish_after_frame_submits_then_closes () =
+  let app, state =
+    make_app ~mode:`Primary ~terminal_tty:true ~render_offset:10
+      ~target_fps:None ()
+  in
+  set_sync_capable app;
+  let frames = ref 0 in
+  Matrix.run app ~on_render:(fun app ->
+      incr frames;
+      Matrix.Grid.draw_text (Matrix.grid app) ~x:0 ~y:0 ~text:"final-history";
+      Matrix.finish_after_frame app);
+  let frame_output = output state in
+  equal ~msg:"one final frame" int 1 !frames;
+  is_true ~msg:"final frame is submitted"
+    (contains_substring "final-history" frame_output);
+  is_true ~msg:"cursor moves below final history"
+    (contains_substring "\027[12;1H" frame_output);
+  is_true ~msg:"frame and cursor handoff are synchronized"
+    (is_before ~first:"\027[?2026h" ~second:"final-history" frame_output
+    && is_before ~first:"final-history" ~second:"\027[12;1H" frame_output
+    && is_before ~first:"\027[12;1H" ~second:"\027[?2026l" frame_output);
+  equal ~msg:"finish does not poll input after close" int 0 state.read_calls;
+  equal ~msg:"finish restores raw mode" int 1 state.raw_restore_calls;
+  equal ~msg:"finish releases backend" int 1 state.cleanup_calls;
+  is_false ~msg:"finished runtime is stopped" (Matrix.running app)
+
+let test_finish_after_full_height_scrolls_to_handoff_row () =
+  let app, state =
+    make_app ~mode:`Primary ~terminal_tty:true ~width:20 ~height:3
+      ~target_fps:None ()
+  in
+  Matrix.run app ~on_render:(fun app ->
+      Matrix.Grid.draw_text (Matrix.grid app) ~x:0 ~y:2 ~text:"bottom";
+      Matrix.finish_after_frame app);
+  let frame_output = output state in
+  is_true ~msg:"bottom content is submitted"
+    (contains_substring "bottom" frame_output);
+  is_true ~msg:"bottom handoff scrolls one row"
+    (contains_substring "\027[3;1H\r\n" frame_output)
+
 let test_close_restores_owned_signal_dispositions_once () =
   with_distinct_signal_handlers @@ fun entries ->
   let read_fd, write_fd = Unix.pipe ~cloexec:true () in
@@ -1356,6 +1412,12 @@ let () =
             test_end_of_input_finalizes_parser_and_closes_once;
           test "close restores raw mode if terminal close raises"
             test_close_restores_raw_mode_if_terminal_close_raises;
+          test "primary close preserves presented cells"
+            test_primary_close_preserves_presented_cells;
+          test "finish after frame submits then closes"
+            test_finish_after_frame_submits_then_closes;
+          test "finish after full height scrolls to handoff row"
+            test_finish_after_full_height_scrolls_to_handoff_row;
           test "close restores owned signal dispositions once"
             test_close_restores_owned_signal_dispositions_once;
           test "attach failure preserves signal dispositions"

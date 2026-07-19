@@ -88,6 +88,7 @@ type app = {
   mutable frame_dump_pattern : string option;
   mutable frame_dump_hits : bool;
   mutable frame_dump_counter : int;
+  mutable finish_after_frame_requested : bool;
   mutable closed : bool;
   mutable loop_active : bool;
   mutable control_state : control_state;
@@ -713,9 +714,10 @@ let submit ?primary_required_rows t =
     in
     (* In full mode on primary screen, cap to active_height to skip blank
        rows and erase below content to clear stale rows. *)
+    let frame_active_height = Screen.active_height t.screen in
     let active_h =
       if forced_full && t.config.mode = `Primary then
-        Some (max 1 (Screen.active_height t.screen))
+        Some (max 1 frame_active_height)
       else None
     in
     let render_height =
@@ -753,12 +755,25 @@ let submit ?primary_required_rows t =
       | `Alt -> t.height
     in
     if
-      Buffer.length buf > preamble_len || cursor_dirty t ~cursor ~cursor_max_row
+      Buffer.length buf > preamble_len
+      || t.finish_after_frame_requested
+      || cursor_dirty t ~cursor ~cursor_max_row
     then begin
       if t.config.mode = `Alt then
         Buffer.add_string buf
           Ansi.(to_string (cursor_position ~row:t.height ~col:1));
-      apply_cursor_state t ~buf ~cursor ~cursor_max_row;
+      (match (t.finish_after_frame_requested, t.config.mode) with
+      | true, `Primary ->
+          let last_row =
+            Primary.render_offset t.primary + frame_active_height
+          in
+          if last_row >= t.height then (
+            buf_cursor_position buf ~row:t.height ~col:1;
+            Buffer.add_string buf "\r\n")
+          else buf_cursor_position buf ~row:(max 1 (last_row + 1)) ~col:1;
+          Buffer.add_string buf Ansi.(to_string (enable Cursor_visible))
+      | true, `Alt | false, (`Primary | `Alt) ->
+          apply_cursor_state t ~buf ~cursor ~cursor_max_row);
       if use_sync then
         Buffer.add_string buf Ansi.(to_string (disable Sync_output));
 
@@ -787,6 +802,12 @@ let stop t =
     update_loop_active t;
     t.redraw_requested <- false;
     t.wake ())
+
+let finish_after_frame t =
+  if not t.closed then (
+    t.finish_after_frame_requested <- true;
+    force_full_redraw t;
+    request_immediate_redraw t)
 
 let request_live t =
   if t.closed then ()
@@ -990,22 +1011,6 @@ let close t =
     t.control_state <- `Explicit_stopped;
     update_loop_active t;
     (try
-       let is_tty = Terminal.tty t.terminal in
-       if t.config.mode = `Primary && is_tty then (
-         let height = max 1 t.height in
-         let render_offset =
-           clamp 0 (height - 1) (Primary.render_offset t.primary)
-         in
-         let start_row =
-           if Primary.static_needs_newline t.primary then render_offset + 1
-           else max 1 render_offset
-         in
-         for row = start_row to height do
-           Terminal.move_cursor t.terminal ~row ~col:1
-             ~visible:(Terminal.cursor_visible t.terminal);
-           Terminal.send t.terminal erase_entire_line
-         done;
-         Terminal.move_cursor t.terminal ~row:start_row ~col:1 ~visible:true);
        (* Flush pending mouse/input bytes both before and after mode teardown.
           This avoids leaking trailing SGR mouse payloads back to the shell. *)
        (try t.flush_input () with _ -> ());
@@ -1123,6 +1128,7 @@ let init_app (c : config) ~write_output ~now ~wake ~terminal_size ~set_raw_mode
       frame_dump_pattern;
       frame_dump_hits;
       frame_dump_counter = 0;
+      finish_after_frame_requested = false;
       closed = false;
       loop_active = false;
       control_state =
@@ -1441,6 +1447,7 @@ let run ?on_frame ?on_input ?on_resize ?primary_required_rows ~on_render t =
       | None -> None
     in
     submit ?primary_required_rows:required_rows_hint t;
+    if t.finish_after_frame_requested then close t;
     user_end
   in
 
@@ -1489,25 +1496,26 @@ let run ?on_frame ?on_input ?on_resize ?primary_required_rows ~on_render t =
       if should_render_now t ~now then (
         let frame_interval = compute_loop_interval t in
         let last_time = render_cycle ~now ~last_time in
-        (* Schedule next frame deadline after rendering: delay =
-           target_frame_time - frame_elapsed. The deadline drives only the
-           live cadence — left armed while idle it would read as perpetually
-           due and spin the loop; one-shot pacing hangs off
-           [last_render_time] instead. *)
-        let render_end = t.now () in
-        t.last_render_time <- render_end;
-        t.next_frame_deadline <-
-          (if t.loop_active then
-             match frame_interval with
-             | Some iv ->
-                 let elapsed = render_end -. now in
-                 let delay = Float.max 0. (iv -. elapsed) in
-                 Some (render_end +. delay)
-             | None -> None
-           else None);
-        let timeout = compute_timeout t ~now:render_end in
-        read_events ~now:render_end ~timeout;
-        loop last_time)
+        if running t then (
+          (* Schedule next frame deadline after rendering: delay =
+             target_frame_time - frame_elapsed. The deadline drives only the
+             live cadence — left armed while idle it would read as perpetually
+             due and spin the loop; one-shot pacing hangs off
+             [last_render_time] instead. *)
+          let render_end = t.now () in
+          t.last_render_time <- render_end;
+          t.next_frame_deadline <-
+            (if t.loop_active then
+               match frame_interval with
+               | Some iv ->
+                   let elapsed = render_end -. now in
+                   let delay = Float.max 0. (iv -. elapsed) in
+                   Some (render_end +. delay)
+               | None -> None
+             else None);
+          let timeout = compute_timeout t ~now:render_end in
+          read_events ~now:render_end ~timeout;
+          loop last_time))
       else
         let timeout = compute_timeout t ~now in
         read_events ~now ~timeout;

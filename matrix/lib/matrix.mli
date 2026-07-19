@@ -223,11 +223,20 @@ val submit : ?primary_required_rows:int -> app -> unit
 
 val close : app -> unit
 (** [close app] idempotently tears down terminal protocols and raw mode, then
-    releases backend resources. *)
+    releases backend resources. Primary-screen cells are preserved; alternate
+    mode restores the terminal's previous primary buffer. *)
 
 val stop : app -> unit
 (** [stop app] marks the runtime as stopped. The {!run} loop exits on the next
     tick. *)
+
+val finish_after_frame : app -> unit
+(** [finish_after_frame app] requests orderly termination after the current or
+    next frame has been submitted. In [`Primary] mode Matrix places the visible
+    cursor on the row after the frame's active content and preserves presented
+    cells while restoring terminal protocols. If active content reaches the
+    terminal bottom, the cursor handoff scrolls by one row. In [`Alt] mode the
+    alternate screen is restored normally. *)
 
 val start : app -> unit
 (** [start app] resumes the render cadence and marks the control state as
